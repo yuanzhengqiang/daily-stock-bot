@@ -6,28 +6,25 @@ import os
 import requests
 
 def get_indices_stocks():
-    """获取上证50、沪深300、科创50的成分股并去重"""
-    indices = {
-        "上证50": "000016",
-        "沪深300": "000300",
-        "科创50": "000688"
-    }
+    """获取成分股列表"""
+    indices = {"上证50": "000016", "沪深300": "000300", "科创50": "000688"}
     all_stocks = {}
     print("正在获取成分股列表...")
     for name, code in indices.items():
         try:
-            print(f"正在抓取 {name} ({code})...")
             df = ak.index_stock_cons(symbol=code)
             if not df.empty:
                 for _, row in df.iterrows():
                     all_stocks[row['品种代码']] = row['品种名称']
-            time.sleep(1)
+            time.sleep(0.5)
         except Exception as e:
             print(f"获取 {name} 失败: {e}")
     return all_stocks
 
-def get_signals(df):
-    """纯 pandas 计算指标逻辑 (主图金钻 + 副图粉色)"""
+def calculate_logic(df):
+    """
+    通用指标计算逻辑，适用于日线或周线数据
+    """
     try:
         if len(df) < 65: return False, False
         close = df['收盘'].astype(float)
@@ -41,7 +38,7 @@ def get_signals(df):
         ma_h = ema(ema(high, 25), 25)
         ma_l = ema(ema(low, 25), 25)
         trend_line = ma_l - (ma_h - ma_l)
-        main_yellow = low <= trend_line
+        is_yellow = low <= trend_line
 
         # 2. 副图逻辑: 散户线 + 股价趋势
         hhv_60 = high.rolling(60).max()
@@ -55,69 +52,72 @@ def get_signals(df):
         price_trend = 3 * sma_5 - 2 * sma_3
         pink_2 = price_trend <= 10
 
-        return main_yellow.iloc[-1], (pink_1.iloc[-1] or pink_2.iloc[-1])
+        return is_yellow.iloc[-1], (pink_1.iloc[-1] or pink_2.iloc[-1])
     except:
         return False, False
 
 def send_wechat(content):
-    """通过 PushPlus 发送微信通知"""
+    """微信推送"""
     token = os.environ.get('PUSHPLUS_TOKEN')
-    if not token:
-        print("未配置 PUSHPLUS_TOKEN，跳过微信推送。")
-        return
-
+    if not token: return
     url = "http://www.pushplus.plus/send"
     data = {
         "token": token,
-        "title": f"📈 股票共振推荐 - {datetime.date.today()}",
+        "title": f"🔔 日周共振超强信号 - {datetime.date.today()}",
         "content": content.replace("\n", "<br>"),
         "template": "html"
     }
-    try:
-        res = requests.post(url, json=data)
-        print(f"微信推送结果: {res.text}")
-    except Exception as e:
-        print(f"微信推送出错: {e}")
+    requests.post(url, json=data)
 
 def main():
-    print(f"[{datetime.datetime.now()}] 🚀 启动精选指数扫描...")
-    
+    print(f"[{datetime.datetime.now()}] 🚀 启动日周线共振扫描...")
     stock_dict = get_indices_stocks()
-    if not stock_dict:
-        print("❌ 错误: 无法获取成分股列表。")
-        return
+    if not stock_dict: return
 
     all_codes = list(stock_dict.keys())
     total = len(all_codes)
-    print(f"去重后共计 {total} 只股票。开始扫描...")
-
-    res_resonance = []
-    res_yellow = []
+    
+    super_resonance = [] # 日周共振
+    daily_only = []      # 仅日线符合
 
     for idx, code in enumerate(all_codes):
-        if (idx + 1) % 50 == 0:
-            print(f"进度: {idx+1}/{total}...")
-
+        if (idx + 1) % 50 == 0: print(f"扫描进度: {idx+1}/{total}...")
+        
         try:
-            time.sleep(0.2)
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
-            if df is None or df.empty: continue
+            # 1. 抓取日线数据
+            df_d = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
+            d_yellow, d_pink = calculate_logic(df_d)
             
-            yellow, pink = get_signals(df)
-            if yellow and pink:
-                res_resonance.append(f"🔥 [共振] {code}-{stock_dict[code]}")
-            elif yellow:
-                res_yellow.append(f"🟡 [触底] {code}-{stock_dict[code]}")
-        except:
+            # 如果日线都不符合，就不浪费时间抓周线了
+            if not (d_yellow and d_pink):
+                continue
+            
+            # 2. 抓取周线数据 (只有日线符合了才看周线)
+            time.sleep(0.1) # 稍微延迟防封
+            df_w = ak.stock_zh_a_hist(symbol=code, period="weekly", adjust="qfq")
+            w_yellow, w_pink = calculate_logic(df_w)
+            
+            stock_info = f"{code}-{stock_dict[code]}"
+            
+            if w_yellow and w_pink:
+                print(f"💎 [日周共振] {stock_info}")
+                super_resonance.append(stock_info)
+            else:
+                print(f"✅ [仅日线符合] {stock_info}")
+                daily_only.append(stock_info)
+                
+        except Exception as e:
             continue
 
-    # 构造报告
+    # 构造推送报告
     report = f"📅 日期: {datetime.date.today()}\n"
-    report += "### 💎 强力推荐 (共振)\n"
-    report += "\n".join(res_resonance) if res_resonance else "今日无共振信号。"
-    report += "\n\n### 🟡 关注 (主图触底)\n"
-    report += "\n".join(res_yellow[:20]) if res_yellow else "无。"
+    report += "## 💎 日周线双重共振 (极高成功率)\n"
+    report += "\n".join([f"- {s}" for s in super_resonance]) if super_resonance else "今日无共振信号。"
     
+    report += "\n\n### 🟢 仅日线符合 (波段机会)\n"
+    report += "\n".join([f"- {s}" for s in daily_only[:15]]) if daily_only else "无。"
+    if len(daily_only) > 15: report += f"\n...等共 {len(daily_only)} 只"
+
     print(report)
     send_wechat(report)
 
