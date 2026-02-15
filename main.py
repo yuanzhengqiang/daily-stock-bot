@@ -5,81 +5,121 @@ import time
 import os
 import requests
 
-# --- 之前定义的 get_indices_stocks 和 get_signals 函数保持不变 ---
-# (为了节省篇幅，这里略过，请确保你代码里有这两个函数)
+def get_indices_stocks():
+    """获取上证50、沪深300、科创50的成分股并去重"""
+    indices = {
+        "上证50": "000016",
+        "沪深300": "000300",
+        "科创50": "000688"
+    }
+    all_stocks = {}
+    print("正在获取成分股列表...")
+    for name, code in indices.items():
+        try:
+            print(f"正在抓取 {name} ({code})...")
+            df = ak.index_stock_cons(symbol=code)
+            if not df.empty:
+                for _, row in df.iterrows():
+                    all_stocks[row['品种代码']] = row['品种名称']
+            time.sleep(1)
+        except Exception as e:
+            print(f"获取 {name} 失败: {e}")
+    return all_stocks
+
+def get_signals(df):
+    """纯 pandas 计算指标逻辑 (主图金钻 + 副图粉色)"""
+    try:
+        if len(df) < 65: return False, False
+        close = df['收盘'].astype(float)
+        high = df['最高'].astype(float)
+        low = df['最低'].astype(float)
+
+        def ema(series, n): return series.ewm(span=n, adjust=False).mean()
+        def sma_tdx(series, n): return series.ewm(alpha=1/n, adjust=False).mean()
+
+        # 1. 主图逻辑: 金钻趋势
+        ma_h = ema(ema(high, 25), 25)
+        ma_l = ema(ema(low, 25), 25)
+        trend_line = ma_l - (ma_h - ma_l)
+        main_yellow = low <= trend_line
+
+        # 2. 副图逻辑: 散户线 + 股价趋势
+        hhv_60 = high.rolling(60).max()
+        llv_60 = low.rolling(60).min()
+        retail_line = 100 * (hhv_60 - close) / (hhv_60 - llv_60)
+        pink_1 = (retail_line.shift(1) >= 90) & (retail_line < 90)
+
+        stoch_27 = 100 * (close - low.rolling(27).min()) / (high.rolling(27).max() - low.rolling(27).min())
+        sma_5 = sma_tdx(stoch_27, 5)
+        sma_3 = sma_tdx(sma_5, 3)
+        price_trend = 3 * sma_5 - 2 * sma_3
+        pink_2 = price_trend <= 10
+
+        return main_yellow.iloc[-1], (pink_1.iloc[-1] or pink_2.iloc[-1])
+    except:
+        return False, False
 
 def send_wechat(content):
-    """
-    通过 PushPlus 发送微信通知
-    """
+    """通过 PushPlus 发送微信通知"""
     token = os.environ.get('PUSHPLUS_TOKEN')
     if not token:
-        print("未配置 PushPlus Token，跳过微信推送。")
+        print("未配置 PUSHPLUS_TOKEN，跳过微信推送。")
         return
 
     url = "http://www.pushplus.plus/send"
     data = {
         "token": token,
         "title": f"📈 股票共振推荐 - {datetime.date.today()}",
-        "content": content.replace("\n", "<br>"), # 微信换行处理
+        "content": content.replace("\n", "<br>"),
         "template": "html"
     }
     try:
-        response = requests.post(url, json=data)
-        if response.status_code == 200:
-            print("微信推送成功！")
-        else:
-            print(f"微信推送失败: {response.text}")
+        res = requests.post(url, json=data)
+        print(f"微信推送结果: {res.text}")
     except Exception as e:
         print(f"微信推送出错: {e}")
 
-# 这里是 main 函数的结尾修改版
 def main():
-    print(f"[{datetime.datetime.now()}] 🚀 启动指数扫描...")
+    print(f"[{datetime.datetime.now()}] 🚀 启动精选指数扫描...")
     
-    # 获取代码 (代码同上)
     stock_dict = get_indices_stocks()
-    if not stock_dict: return
+    if not stock_dict:
+        print("❌ 错误: 无法获取成分股列表。")
+        return
+
+    all_codes = list(stock_dict.keys())
+    total = len(all_codes)
+    print(f"去重后共计 {total} 只股票。开始扫描...")
 
     res_resonance = []
     res_yellow = []
-    
-    # 扫描逻辑 (代码同上)
-    all_codes = list(stock_dict.keys())
+
     for idx, code in enumerate(all_codes):
+        if (idx + 1) % 50 == 0:
+            print(f"进度: {idx+1}/{total}...")
+
         try:
             time.sleep(0.2)
             df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
             if df is None or df.empty: continue
+            
             yellow, pink = get_signals(df)
             if yellow and pink:
-                res_resonance.append(f"🔥 [共振] {code} - {stock_dict[code]}")
+                res_resonance.append(f"🔥 [共振] {code}-{stock_dict[code]}")
             elif yellow:
-                res_yellow.append(f"🟡 [触底] {code} - {stock_dict[code]}")
-        except: continue
+                res_yellow.append(f"🟡 [触底] {code}-{stock_dict[code]}")
+        except:
+            continue
 
-    # 1. 构造报告内容
-    report_header = f"📅 扫描日期: {datetime.date.today()}\n"
-    report_header += f"✅ 范围: 上证50/沪深300/科创50\n\n"
+    # 构造报告
+    report = f"📅 日期: {datetime.date.today()}\n"
+    report += "### 💎 强力推荐 (共振)\n"
+    report += "\n".join(res_resonance) if res_resonance else "今日无共振信号。"
+    report += "\n\n### 🟡 关注 (主图触底)\n"
+    report += "\n".join(res_yellow[:20]) if res_yellow else "无。"
     
-    body = "### 💎 强力推荐 (双重共振)\n"
-    if res_resonance:
-        for r in res_resonance: body += f"{r}\n"
-    else:
-        body += "今日暂无共振信号。\n"
+    print(report)
+    send_wechat(report)
 
-    body += "\n### 🟡 关注名单 (主图触底)\n"
-    if res_yellow:
-        for r in res_yellow[:20]: body += f"{r}\n"
-        if len(res_yellow) > 20: body += f"...等共 {len(res_yellow)} 只\n"
-    
-    # 2. 打印到控制台 (为了让 GitHub Issue 也能收到)
-    full_report = report_header + body
-    print(full_report)
-
-    # 3. 发送微信推送
-    send_wechat(full_report)
-
-# ... 别忘了调用 main()
 if __name__ == "__main__":
     main()
