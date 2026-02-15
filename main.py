@@ -2,40 +2,55 @@ import akshare as ak
 import pandas as pd
 import datetime
 import time
-import random
 
-def get_stock_list_with_retry(retries=10):
+def get_indices_stocks():
     """
-    针对海外IP极其不稳定的情况，增加多次重试
+    获取上证50、沪深300、科创50的成分股并去重
     """
-    for i in range(retries):
+    indices = {
+        "上证50": "000016",
+        "沪深300": "000300",
+        "科创50": "000688"
+    }
+    all_stocks = {}
+    
+    print("正在获取成分股列表...")
+    for name, code in indices.items():
         try:
-            print(f"尝试抓取全A股列表 (第 {i+1} 次)...")
-            # 尝试最常用的接口
-            df = ak.stock_zh_a_spot_em()
-            if df is not None and not df.empty:
-                return dict(zip(df['代码'], df['名称']))
+            print(f"正在抓取 {name} ({code})...")
+            # 获取成分股
+            df = ak.index_stock_cons(symbol=code)
+            if not df.empty:
+                # 建立 代码 -> 名称 的映射
+                for _, row in df.iterrows():
+                    all_stocks[row['品种代码']] = row['品种名称']
+            time.sleep(1) # 稍微歇一下
         except Exception as e:
-            print(f"尝试失败: {e}")
-            # 随机等待 5-15 秒再重试，模仿人类行为
-            time.sleep(random.randint(5, 15))
-    return None
+            print(f"获取 {name} 失败: {e}")
+            
+    return all_stocks
 
 def get_signals(df):
+    """
+    纯 pandas 指标计算逻辑 (主图金钻 + 副图粉色)
+    """
     try:
         if len(df) < 65: return False, False
         close = df['收盘'].astype(float)
         high = df['最高'].astype(float)
         low = df['最低'].astype(float)
 
+        # 核心算法
         def ema(series, n): return series.ewm(span=n, adjust=False).mean()
         def sma_tdx(series, n): return series.ewm(alpha=1/n, adjust=False).mean()
 
+        # 主图逻辑
         ma_h = ema(ema(high, 25), 25)
         ma_l = ema(ema(low, 25), 25)
         trend_line = ma_l - (ma_h - ma_l)
         main_yellow = low <= trend_line
 
+        # 副图逻辑
         hhv_60 = high.rolling(60).max()
         llv_60 = low.rolling(60).min()
         retail_line = 100 * (hhv_60 - close) / (hhv_60 - llv_60)
@@ -52,49 +67,63 @@ def get_signals(df):
         return False, False
 
 def main():
-    print(f"[{datetime.datetime.now()}] 🚀 启动全A股扫描...")
+    print(f"[{datetime.datetime.now()}] 🚀 启动精选指数扫描 (50+300+科创50)...")
     
-    stock_dict = get_stock_list_with_retry()
+    stock_dict = get_indices_stocks()
     if not stock_dict:
-        print("❌ 错误: 无法获取股票列表。建议：手动运行 Actions 或更换运行时间。")
+        print("❌ 错误: 无法获取任何成分股列表。")
         return
 
     all_codes = list(stock_dict.keys())
-    print(f"获取列表成功，共 {len(all_codes)} 只。开始扫描...")
+    total = len(all_codes)
+    print(f"去重后共计 {total} 只股票。开始深度扫描...")
 
     res_resonance = []
-    # 为了防止全量扫描被封IP，我们这里设置只扫前 2000 只最活跃的，或者你也可以保持全量
-    # all_codes = all_codes[:2000] 
+    res_yellow = []
 
     for idx, code in enumerate(all_codes):
-        if idx % 100 == 0:
-            print(f"进度: {idx}/{len(all_codes)}...")
+        if (idx + 1) % 50 == 0:
+            print(f"进度: {idx+1}/{total}...")
 
         try:
-            # 核心：每次请求稍微歇一下，降低频率
-            time.sleep(0.1) 
+            # 即使股票少了，也建议保留微小延迟，模拟真实访问
+            time.sleep(0.2) 
             
+            # 获取历史行情
             df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
             if df is None or df.empty: continue
             
             yellow, pink = get_signals(df)
+            
             if yellow and pink:
-                msg = f"🔥 [共振] {code} - {stock_dict[code]}"
+                msg = f"🔥 [双重共振] {code} - {stock_dict[code]}"
                 print(msg)
                 res_resonance.append(msg)
-        except:
-            # 如果单只股票下载失败（被断开），歇久一点
-            time.sleep(1)
+            elif yellow:
+                res_yellow.append(f"🟡 [主图触底] {code} - {stock_dict[code]}")
+        except Exception:
             continue
 
+    # 打印最终报表
     print("\n" + "="*40)
     print(f"📅 扫描日期: {datetime.date.today()}")
-    print("\n### 💎 强力推荐 (双重共振)")
+    print(f"✅ 扫描范围: 上证50 / 沪深300 / 科创50")
+    print("="*40)
+    
+    print("\n### 💎 强力推荐 (主副图双重共振)")
     if res_resonance:
         for r in res_resonance: print(f"- {r}")
     else:
         print("- 今日暂无共振买点。")
-    print("="*40)
+
+    print("\n### 🟡 关注名单 (仅主图触底)")
+    if res_yellow:
+        for r in res_yellow[:30]: print(f"- {r}")
+        if len(res_yellow) > 30: print(f"- ...等共计 {len(res_yellow)} 只")
+    else:
+        print("- 无。")
+
+    print("\n" + "="*40)
 
 if __name__ == "__main__":
     main()
