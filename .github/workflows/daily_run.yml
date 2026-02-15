@@ -39,10 +39,11 @@ jobs:
 
       # 5. 执行 Python 脚本并捕获输出
       - name: Run Main Script
+        env:
+          # 这一行很关键：把 GitHub Secrets 里的变量传给 Python 
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: |
-          # 运行 main.py 并将打印的内容全部保存到 result.txt
           python main.py > result.txt
-          # 同时在后台控制台打印一份，方便查看进度
           cat result.txt
 
       # 6. 将结果作为新的 Issue 发布 (这是你的看涨报告)
