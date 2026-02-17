@@ -5,152 +5,173 @@ import time
 import os
 import requests
 
-def get_a_indices_stocks():
-    """获取上证50、沪深300、中证1000、科创50成分股并去重"""
-    indices = {
-        "上证50": "000016",
-        "沪深300": "000300",
-        "中证1000": "000852",
-        "科创50": "000688"
-    }
-    all_stocks = {}
-    print("正在获取 A 股核心指数成分股列表...")
-    for name, code in indices.items():
-        try:
-            print(f"正在读取 {name}...")
-            df = ak.index_stock_cons(symbol=code)
-            if not df.empty:
-                for _, row in df.iterrows():
-                    # 建立 代码 -> 名称 的映射
-                    all_stocks[row['品种代码']] = row['品种名称']
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"获取 {name} 失败: {e}")
-    return all_stocks
+# ==========================================
+# 1. 核心筛选逻辑 (你原有的日周月共振)
+# ==========================================
 
-def calculate_logic(df):
-    """
-    核心选股逻辑：金钻趋势线 + 副图粉色信号
-    兼容新股：只要数据超过30条就尝试计算
-    """
+def calculate_indicator(df):
+    """计算金钻+粉色指标，返回是否符合信号"""
     try:
-        if df is None or len(df) < 30: 
-            return False
-        
-        # 确保列名正确（兼容处理）
-        m = {'收盘': 'close', '最高': 'high', '最低': 'low', '日期': 'date'}
-        df = df.rename(columns=m)
-        
-        close = df['close'].astype(float)
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
+        if df is None or len(df) < 60: return False
+        df.columns = [str(c).lower() for c in df.columns]
+        df = df.rename(columns={'收盘': 'close', '最高': 'high', '最低': 'low'})
+        close, high, low = df['close'].astype(float), df['high'].astype(float), df['low'].astype(float)
 
         def ema(s, n): return s.ewm(span=n, adjust=False).mean()
         def sma(s, n): return s.ewm(alpha=1/n, adjust=False).mean()
 
-        # 1. 主图金钻趋势线 (双重 EMA)
-        ma_h = ema(ema(high, 25), 25)
-        ma_l = ema(ema(low, 25), 25)
+        # 主图金钻
+        ma_h, ma_l = ema(ema(high, 25), 25), ema(ema(low, 25), 25)
         trend_line = ma_l - (ma_h - ma_l)
         
-        # 2. 副图指标
-        # 散户线 (60日高低点，若数据不足则用全部)
-        window_60 = min(len(df), 60)
-        hhv_60 = high.rolling(window=window_60).max()
-        llv_60 = low.rolling(window=window_60).min()
+        # 副图粉色
+        hhv_60, llv_60 = high.rolling(60).max(), low.rolling(60).min()
         retail = 100 * (hhv_60 - close) / (hhv_60 - llv_60)
-        
-        # 价格趋势 (27日)
-        window_27 = min(len(df), 27)
-        stoch = 100 * (close - low.rolling(window=window_27).min()) / (high.rolling(window=window_27).max() - low.rolling(window=window_27).min())
-        sma_5 = sma(stoch, 5)
-        price_trend = 3 * sma_5 - 2 * sma(sma_5, 3)
+        stoch = 100 * (close - low.rolling(27).min()) / (high.rolling(27).max() - low.rolling(27).min())
+        price_trend = 3 * sma(stoch, 5) - 2 * sma(sma(stoch, 5), 3)
 
-        # 判定条件：
-        # 价格低于趋势线 且 (散户线在超卖高位 或 趋势指标在低位)
-        # 判断最近 2 根 K 线（包含今天和昨天），增加容错
+        # 判断：价格在趋势线下 且 (散户线超卖 或 趋势线超卖)
         cond = (low <= trend_line) & ((retail > 85) | (price_trend < 15))
-        
-        return cond.tail(2).any()
-    except:
-        return False
+        return cond.tail(3).any()
+    except: return False
 
-def send_wechat(content):
-    """通过 PushPlus 推送"""
-    token = os.environ.get('PUSHPLUS_TOKEN')
-    if not token: 
-        return
-    url = "http://www.pushplus.plus/send"
-    data = {
-        "token": token,
-        "title": f"📈 A股多周期扫描报告 - {datetime.date.today()}",
-        "content": content.replace("\n", "<br>"),
-        "template": "html"
-    }
-    requests.post(url, json=data)
+# ==========================================
+# 2. 深度分析逻辑 (参考 ZhuLinsen/daily_stock_analysis)
+# ==========================================
+
+def perform_deep_analysis(df, code, name):
+    """
+    参考 fork 项目的逻辑：综合 RSI, MA, 乖离率和成交量进行评分
+    返回：评分(0-100) + 投资建议
+    """
+    try:
+        df.columns = [str(c).lower() for c in df.columns]
+        df = df.rename(columns={'收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume'})
+        close = df['close'].astype(float)
+        
+        score = 60 # 基础分 (因为能过筛选逻辑，本身已经有60分基础)
+        reasons = []
+
+        # 1. 检查 RSI (判断是否过度杀跌后开始回升)
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        current_rsi = rsi.iloc[-1]
+        
+        if 30 < current_rsi < 50:
+            score += 15
+            reasons.append("RSI从超卖区回升，具备反弹动力")
+        
+        # 2. 均线系统 (检查是否站上5日线)
+        ma5 = close.rolling(5).mean()
+        if close.iloc[-1] > ma5.iloc[-1]:
+            score += 10
+            reasons.append("股价站上5日均线，短线走强")
+        
+        # 3. 成交量检查 (是否有放量迹象)
+        vol_ma5 = df['volume'].rolling(5).mean()
+        if df['volume'].iloc[-1] > vol_ma5.iloc[-1] * 1.2:
+            score += 10
+            reasons.append("成交量较均值放量，资金介入明显")
+        
+        # 4. 乖离率检查 (防范二次杀跌)
+        bias = (close.iloc[-1] - close.rolling(20).mean().iloc[-1]) / close.rolling(20).mean().iloc[-1] * 100
+        if bias < -10:
+            score += 5
+            reasons.append("偏离20日均线过远，存在估值修复空间")
+
+        # 投资结论
+        if score >= 85:
+            verdict = "🌟 强烈建议关注 (Strong Buy)"
+        elif score >= 75:
+            verdict = "💎 建议关注 (Buy)"
+        else:
+            verdict = "🟢 观望/试探 (Watch)"
+
+        analysis_report = f"【技术评分: {score}分】\n"
+        analysis_report += f"📊 结论: {verdict}\n"
+        analysis_report += "📝 理由: " + "；".join(reasons)
+        return analysis_report
+    except:
+        return "⚠️ 分析模型计算异常"
+
+# ==========================================
+# 3. 主流程
+# ==========================================
 
 def main():
-    print(f"[{datetime.datetime.now()}] 🚀 启动 A 股精选池深度扫描...")
-    stock_dict = get_a_indices_stocks()
-    if not stock_dict: return
+    print(f"[{datetime.datetime.now()}] 🚀 启动 A 股全维度‘筛选+分析’系统...")
+    
+    # 获取成分股 (上证50, 沪深300, 中证1000, 科创50)
+    stocks = {}
+    indices = {"上证50": "000016", "沪深300": "000300", "中证1000": "000852", "科创50": "000688"}
+    for name, code in indices.items():
+        try:
+            df = ak.index_stock_cons(symbol=code)
+            for _, row in df.iterrows(): stocks[row['品种代码']] = row['品种名称']
+        except: continue
 
-    all_codes = list(stock_dict.keys())
+    all_codes = list(stocks.keys())
     total = len(all_codes)
-    print(f"去重后共计 {total} 只股票。开始扫描...")
-
-    triple_list, double_list, daily_list = [], [], []
+    
+    triple_match, double_match, daily_match = [], [], []
     last_date = "未知"
 
     for idx, code in enumerate(all_codes):
-        if (idx + 1) % 200 == 0:
-            print(f"进度: {idx+1}/{total}...")
-
+        if (idx+1) % 200 == 0: print(f"进度: {idx+1}/{total}")
         try:
-            # 1. 检查日线
+            # 1. 基础筛选 (日线)
             df_d = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
             if df_d is None or df_d.empty: continue
+            if last_date == "未知": last_date = df_d.iloc[-1]['日期']
             
-            if last_date == "未知":
-                last_date = df_d.iloc[-1]['日期']
-
-            if calculate_logic(df_d):
-                tag = f"{code}-{stock_dict[code]}"
-                
-                # 2. 日线符合，检查周线
+            if calculate_indicator(df_d):
+                # 只有日线符合，才进行更高级别的周线、月线检查
                 time.sleep(0.1)
                 df_w = ak.stock_zh_a_hist(symbol=code, period="weekly", adjust="qfq")
-                if calculate_logic(df_w):
-                    # 3. 周线符合，检查月线
-                    df_m = ak.stock_zh_a_hist(symbol=code, period="monthly", adjust="qfq")
-                    if calculate_logic(df_m):
-                        triple_list.append(tag)
-                    else:
-                        double_list.append(tag)
+                df_m = ak.stock_zh_a_hist(symbol=code, period="monthly", adjust="qfq")
+                
+                res_w = calculate_indicator(df_w)
+                res_m = calculate_indicator(df_m)
+                
+                # 运行来自 fork 项目的深度分析逻辑
+                analysis_detail = perform_deep_analysis(df_d, code, stocks[code])
+                stock_report = f"📌 {code}-{stocks[code]}\n{analysis_detail}"
+                
+                if res_w and res_m:
+                    triple_match.append(stock_report)
+                elif res_w:
+                    double_match.append(stock_report)
                 else:
-                    daily_list.append(tag)
-        except:
-            continue
+                    daily_match.append(f"📌 {code}-{stocks[code]} (短线复苏信号)")
+        except: continue
 
-    # 构造报告
-    report = f"📅 报告日期: {datetime.date.today()}\n"
-    report += f"📊 数据截止: {last_date}\n"
-    report += f"✅ 扫描范围: A股核心指数 ({total}只)\n\n"
+    # 报告构造
+    final_content = f"📅 报告日期: {datetime.date.today()}\n📊 数据截止: {last_date}\n\n"
     
-    report += "### 🌟 [日周月] 三期共振 (罕见大底)\n"
-    report += "\n".join([f"- {s}" for s in triple_list]) if triple_list else "今日无。\n"
+    if triple_match:
+        final_content += "🔥 [极品共振 - 三期合一]\n" + "\n\n".join(triple_match) + "\n\n"
     
-    report += "\n### 💎 [日周] 共振 (强化买点)\n"
-    report += "\n".join([f"- {s}" for s in double_list]) if double_list else "今日无。\n"
-    
-    report += "\n### 🟢 [日线] 符合 (基础信号)\n"
-    if daily_list:
-        report += "\n".join([f"- {s}" for s in daily_list[:30]])
-        if len(daily_list) > 30: report += f"\n...等共 {len(daily_list)} 只"
-    else:
-        report += "今日无。"
+    if double_results := double_match:
+        final_content += "💎 [强化推荐 - 日周共振]\n" + "\n\n".join(double_results) + "\n\n"
+        
+    if daily_results := daily_match:
+        final_content += "🟢 [基础信号 - 日线超跌]\n" + "\n".join(daily_results[:20]) + "\n"
+        if len(daily_results) > 20: final_content += f"...等共 {len(daily_results)} 只\n"
 
-    print(report)
-    send_wechat(report)
+    print(final_content)
+
+    # 微信推送 (PushPlus)
+    token = os.environ.get('PUSHPLUS_TOKEN')
+    if token:
+        requests.post("http://www.pushplus.plus/send", json={
+            "token": token,
+            "title": f"今日股票深度筛选报告",
+            "content": final_content.replace("\n", "<br>"),
+            "template": "html"
+        })
 
 if __name__ == "__main__":
     main()
